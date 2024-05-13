@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"log"
+	"net"
 	"strings"
 	"time"
 
@@ -31,7 +34,147 @@ type etcdCreator struct{}
 
 type etcdDB struct {
 	p      *properties.Properties
-	client *clientv3.Client
+	client *TcpClient
+}
+
+type TcpClient struct {
+	Addr string
+}
+
+type GetResponse struct {
+	Count int64
+	Kvs   []*Command
+}
+
+const (
+	GET uint8 = iota
+	PUT
+	DELETE
+)
+
+type Command struct {
+	Op    uint8
+	Key   string
+	Value string
+}
+
+func (cmd *Command) Encode() ([]byte, error) {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	err := enc.Encode(cmd)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (c *TcpClient) Get(key string) (GetResponse, error) {
+	Conn, err := net.Dial("tcp", c.Addr)
+	if err != nil {
+		return GetResponse{}, err
+	}
+	// encode kvs
+	kv := Command{
+		Op:    GET,
+		Key:   key,
+		Value: "",
+	}
+	buf, err := kv.Encode()
+	if err != nil {
+		return GetResponse{}, err
+	}
+
+	// 发送消息
+	_, err = Conn.Write(buf)
+	if err != nil {
+		return GetResponse{}, err
+	}
+
+	// 创建一个足够大的缓冲区来存储数据
+	readBuf := make([]byte, 4096)
+
+	// 读取数据
+	n, err := Conn.Read(readBuf)
+	if err != nil {
+		fmt.Println("Error reading:", err.Error())
+		return GetResponse{}, err
+	}
+
+	// 使用读取的数据
+	data := readBuf[:n]
+
+	// 创建一个新的GetResponse
+	var resp GetResponse
+
+	// 创建一个新的解码器
+	dec := gob.NewDecoder(bytes.NewBuffer(data))
+
+	// 解码数据
+	err = dec.Decode(&resp)
+	if err != nil {
+		fmt.Println("Error decoding:", err.Error())
+		return GetResponse{}, err
+	}
+
+	return resp, nil
+}
+
+func (c *TcpClient) Put(key string, value string) error {
+	Conn, err := net.Dial("tcp", c.Addr)
+	if err != nil {
+		return err
+	}
+	// encode kvs
+	kv := Command{
+		Op:    PUT,
+		Key:   key,
+		Value: value,
+	}
+	buf, err := kv.Encode()
+	if err != nil {
+		return err
+	}
+
+	// 发送消息
+	_, err = Conn.Write(buf)
+
+	if err != nil {
+		return nil
+	}
+
+	// wait for server response
+	response := make([]byte, 256)
+	Conn.Read(response)
+	fmt.Println(string(response))
+	return nil
+}
+
+func (c *TcpClient) Delete(key string) error {
+	Conn, err := net.Dial("tcp", c.Addr)
+	if err != nil {
+		return err
+	}
+	// encode kvs
+	kv := Command{
+		Op:  DELETE,
+		Key: key,
+	}
+	buf, err := kv.Encode()
+	if err != nil {
+		return err
+	}
+
+	// 发送消息
+	_, err = Conn.Write(buf)
+	if err != nil {
+		return err
+	}
+
+	// wait for server response
+	response := make([]byte, 256)
+	Conn.Read(response)
+	fmt.Println(string(response))
+	return nil
 }
 
 func init() {
@@ -39,24 +182,24 @@ func init() {
 }
 
 func (c etcdCreator) Create(p *properties.Properties) (ycsb.DB, error) {
-	cfg, err := getClientConfig(p)
-	if err != nil {
-		return nil, err
+
+	client := TcpClient{
+		Addr: "localhost:9360",
 	}
 
-	client, err := clientv3.New(*cfg)
-	if err != nil {
-		return nil, err
-	}
-
+	log.Println("--------------------- CREATE ---------------------------")
 	return &etcdDB{
 		p:      p,
-		client: client,
+		client: &client,
 	}, nil
 }
 
 func getClientConfig(p *properties.Properties) (*clientv3.Config, error) {
+
+	log.Println("--------------------- Init ---------------------------")
 	endpoints := p.GetString(etcdEndpoints, "localhost:2379")
+
+	fmt.Printf("-----------------------endpoints %s --------------------\n", endpoints)
 	dialTimeout := p.GetDuration(etcdDialTimeout, 2*time.Second)
 
 	var tlsConfig *tls.Config
@@ -81,7 +224,8 @@ func getClientConfig(p *properties.Properties) (*clientv3.Config, error) {
 }
 
 func (db *etcdDB) Close() error {
-	return db.client.Close()
+	return nil
+	//return db.client.Close()
 }
 
 func (db *etcdDB) InitThread(ctx context.Context, _ int, _ int) context.Context {
@@ -97,11 +241,7 @@ func getRowKey(table string, key string) string {
 
 func (db *etcdDB) Read(ctx context.Context, table string, key string, _ []string) (map[string][]byte, error) {
 	rkey := getRowKey(table, key)
-	var options []clientv3.OpOption
-	if db.p.GetBool(etcdSerializableReads, false) {
-		options = append(options, clientv3.WithSerializable())
-	}
-	value, err := db.client.Get(ctx, rkey, options...)
+	value, err := db.client.Get(rkey)
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +251,8 @@ func (db *etcdDB) Read(ctx context.Context, table string, key string, _ []string
 	}
 
 	var r map[string][]byte
-	err = json.NewDecoder(bytes.NewReader(value.Kvs[0].Value)).Decode(&r)
+	log.Println("------------------------ read ----------------------------------")
+	err = json.NewDecoder(bytes.NewReader([]byte(value.Kvs[0].Value))).Decode(&r)
 	if err != nil {
 		return nil, err
 	}
@@ -121,11 +262,7 @@ func (db *etcdDB) Read(ctx context.Context, table string, key string, _ []string
 func (db *etcdDB) Scan(ctx context.Context, table string, startKey string, count int, _ []string) ([]map[string][]byte, error) {
 	res := make([]map[string][]byte, count)
 	rkey := getRowKey(table, startKey)
-	options := []clientv3.OpOption{clientv3.WithFromKey(), clientv3.WithLimit(int64(count))}
-	if db.p.GetBool(etcdSerializableReads, false) {
-		options = append(options, clientv3.WithSerializable())
-	}
-	values, err := db.client.Get(ctx, rkey, options...)
+	values, err := db.client.Get(rkey)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +273,7 @@ func (db *etcdDB) Scan(ctx context.Context, table string, startKey string, count
 
 	for _, v := range values.Kvs {
 		var r map[string][]byte
-		err = json.NewDecoder(bytes.NewReader(v.Value)).Decode(&r)
+		err = json.NewDecoder(bytes.NewReader([]byte(v.Value))).Decode(&r)
 		if err != nil {
 			return nil, err
 		}
@@ -151,7 +288,7 @@ func (db *etcdDB) Update(ctx context.Context, table string, key string, values m
 	if err != nil {
 		return err
 	}
-	_, err = db.client.Put(ctx, rkey, string(data))
+	err = db.client.Put(rkey, string(data))
 	if err != nil {
 		return err
 	}
@@ -160,11 +297,12 @@ func (db *etcdDB) Update(ctx context.Context, table string, key string, values m
 }
 
 func (db *etcdDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
+	//	fmt.Println("-------------------- Insert -------------------------------")
 	return db.Update(ctx, table, key, values)
 }
 
 func (db *etcdDB) Delete(ctx context.Context, table string, key string) error {
-	_, err := db.client.Delete(ctx, getRowKey(table, key))
+	err := db.client.Delete(getRowKey(table, key))
 	if err != nil {
 		return err
 	}

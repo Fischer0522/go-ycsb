@@ -132,7 +132,7 @@ func initialGlobal(dbName string, onProperties func()) {
 	if globalWorkload, err = workloadCreator.Create(globalProps); err != nil {
 		util.Fatalf("create workload %s failed %v", workloadName, err)
 	}
-
+	fmt.Printf("***************** DBNAME:%s *****************", dbName)
 	dbCreator := ycsb.GetDBCreator(dbName)
 	if dbCreator == nil {
 		util.Fatalf("%s is not registered", dbName)
