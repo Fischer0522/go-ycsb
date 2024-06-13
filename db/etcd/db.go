@@ -34,7 +34,7 @@ type etcdCreator struct{}
 
 type etcdDB struct {
 	p      *properties.Properties
-	client *TcpClient
+	client []*TcpClient
 }
 
 type TcpClient struct {
@@ -183,14 +183,9 @@ func init() {
 
 func (c etcdCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 
-	client := TcpClient{
-		Addr: "localhost:9360",
-	}
-
 	log.Println("--------------------- CREATE ---------------------------")
 	return &etcdDB{
-		p:      p,
-		client: &client,
+		p: p,
 	}, nil
 }
 
@@ -228,8 +223,20 @@ func (db *etcdDB) Close() error {
 	//return db.client.Close()
 }
 
-func (db *etcdDB) InitThread(ctx context.Context, _ int, _ int) context.Context {
-	return ctx
+type mytype string
+
+var thread mytype = "tid"
+
+func (db *etcdDB) InitThread(ctx context.Context, threadId int, threadCount int) context.Context {
+	if len(db.client) != threadCount {
+		db.client = make([]*TcpClient, threadCount)
+		for i := range db.client {
+			addr := fmt.Sprintf("localhost:%v", 9360+i)
+			db.client[i] = &TcpClient{Addr: addr}
+		}
+	}
+	log.Printf("------------------------ InitThread %d ----------------------------------\n", threadId)
+	return context.WithValue(ctx, thread, threadId)
 }
 
 func (db *etcdDB) CleanupThread(_ context.Context) {
@@ -240,13 +247,17 @@ func getRowKey(table string, key string) string {
 }
 
 func (db *etcdDB) Read(ctx context.Context, table string, key string, _ []string) (map[string][]byte, error) {
+	tid := ctx.Value(thread).(int)
+
 	rkey := getRowKey(table, key)
-	value, err := db.client.Get(rkey)
+	value, err := db.client[tid].Get(rkey)
 	if err != nil {
+		fmt.Println("client get rky 201 error")
 		return nil, err
 	}
 
 	if value.Count == 0 {
+		fmt.Println("value count  xxzdsfa error")
 		return nil, fmt.Errorf("could not find value for key [%s]", rkey)
 	}
 
@@ -254,20 +265,25 @@ func (db *etcdDB) Read(ctx context.Context, table string, key string, _ []string
 	log.Println("------------------------ read ----------------------------------")
 	err = json.NewDecoder(bytes.NewReader([]byte(value.Kvs[0].Value))).Decode(&r)
 	if err != nil {
+		fmt.Println("Read NewDecoder error")
 		return nil, err
 	}
 	return r, nil
 }
 
 func (db *etcdDB) Scan(ctx context.Context, table string, startKey string, count int, _ []string) ([]map[string][]byte, error) {
+	tid := ctx.Value(thread).(int)
+
 	res := make([]map[string][]byte, count)
 	rkey := getRowKey(table, startKey)
-	values, err := db.client.Get(rkey)
+	values, err := db.client[tid].Get(rkey)
 	if err != nil {
+		fmt.Println("Get xxzdsfa error")
 		return nil, err
 	}
 
 	if values.Count != int64(count) {
+		fmt.Println("Counts error")
 		return nil, fmt.Errorf("unexpected number of result for key [%s], expected %d but was %d", rkey, count, values.Count)
 	}
 
@@ -275,6 +291,7 @@ func (db *etcdDB) Scan(ctx context.Context, table string, startKey string, count
 		var r map[string][]byte
 		err = json.NewDecoder(bytes.NewReader([]byte(v.Value))).Decode(&r)
 		if err != nil {
+			fmt.Println("NewDecoder xcsdaFD error")
 			return nil, err
 		}
 		res = append(res, r)
@@ -283,13 +300,17 @@ func (db *etcdDB) Scan(ctx context.Context, table string, startKey string, count
 }
 
 func (db *etcdDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
+	tid := ctx.Value(thread).(int)
+
 	rkey := getRowKey(table, key)
 	data, err := json.Marshal(values)
 	if err != nil {
+		fmt.Println("Marshal error")
 		return err
 	}
-	err = db.client.Put(rkey, string(data))
+	err = db.client[tid].Put(rkey, string(data))
 	if err != nil {
+		fmt.Println("Put 1234 error")
 		return err
 	}
 
@@ -297,12 +318,14 @@ func (db *etcdDB) Update(ctx context.Context, table string, key string, values m
 }
 
 func (db *etcdDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
-	//	fmt.Println("-------------------- Insert -------------------------------")
+	fmt.Println("-------------------- Insert -------------------------------")
 	return db.Update(ctx, table, key, values)
 }
 
 func (db *etcdDB) Delete(ctx context.Context, table string, key string) error {
-	err := db.client.Delete(getRowKey(table, key))
+	tid := ctx.Value(thread).(int)
+
+	err := db.client[tid].Delete(getRowKey(table, key))
 	if err != nil {
 		return err
 	}
