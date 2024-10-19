@@ -16,6 +16,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"sync"
@@ -208,7 +209,7 @@ func (c *Client) Run(ctx context.Context) {
 	for i := 0; i < threadCount; i++ {
 		go func(threadId int) {
 			defer wg.Done()
-
+			log.Println("thread", threadId, "start")
 			w := newWorker(c.p, threadId, threadCount, c.workload, c.db)
 			ctx := c.workload.InitThread(ctx, threadId, threadCount)
 			ctx = c.db.InitThread(ctx, threadId, threadCount)

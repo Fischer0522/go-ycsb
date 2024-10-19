@@ -59,6 +59,10 @@ type sqliteDB struct {
 	bufPool *util.BufPool
 }
 
+func init() {
+	ycsb.RegisterDBCreator("sqlite", sqliteCreator{})
+}
+
 func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	d := new(sqliteDB)
 	d.p = p
@@ -391,10 +395,6 @@ func (db *sqliteDB) BatchDelete(ctx context.Context, table string, keys []string
 		}
 		return nil
 	})
-}
-
-func init() {
-	ycsb.RegisterDBCreator("sqlite", sqliteCreator{})
 }
 
 var _ ycsb.BatchDB = (*sqliteDB)(nil)

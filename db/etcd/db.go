@@ -3,331 +3,384 @@ package etcd
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"encoding/gob"
-	"encoding/json"
+	"database/sql"
 	"fmt"
-	"log"
-	"net"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
-	clientv3 "go.etcd.io/etcd/client/v3"
+	"github.com/mattn/go-sqlite3"
+	"github.com/pingcap/go-ycsb/pkg/prop"
+	"github.com/pingcap/go-ycsb/pkg/util"
 
 	"github.com/magiconair/properties"
-	"go.etcd.io/etcd/client/pkg/v3/transport"
+	// sqlite package
 
 	"github.com/pingcap/go-ycsb/pkg/ycsb"
 )
 
-// properties
+// Sqlite properties
 const (
-	etcdEndpoints         = "etcd.endpoints"
-	etcdDialTimeout       = "etcd.dial_timeout"
-	etcdCertFile          = "etcd.cert_file"
-	etcdKeyFile           = "etcd.key_file"
-	etcdCaFile            = "etcd.cacert_file"
-	etcdSerializableReads = "etcd.serializable_reads"
+	sqliteDBPath              = "sqlite.db"
+	sqliteMode                = "sqlite.mode"
+	sqliteJournalMode         = "sqlite.journalmode"
+	sqliteCache               = "sqlite.cache"
+	sqliteMaxOpenConns        = "sqlite.maxopenconns"
+	sqliteMaxIdleConns        = "sqlite.maxidleconns"
+	sqliteOptimistic          = "sqlite.optimistic"
+	sqliteOptimisticBackoffMs = "sqlite.optimistic_backoff_ms"
 )
 
-type etcdCreator struct{}
-
-type etcdDB struct {
-	p      *properties.Properties
-	client []*TcpClient
+type sqliteCreator struct {
 }
 
-type TcpClient struct {
-	Addr string
-}
+type sqliteDB struct {
+	p          *properties.Properties
+	db         *sql.DB
+	verbose    bool
+	optimistic bool
+	backoffMs  int
 
-type GetResponse struct {
-	Count int64
-	Kvs   []*Command
-}
-
-const (
-	GET uint8 = iota
-	PUT
-	DELETE
-)
-
-type Command struct {
-	Op    uint8
-	Key   string
-	Value string
-}
-
-func (cmd *Command) Encode() ([]byte, error) {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	err := enc.Encode(cmd)
-	if err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func (c *TcpClient) Get(key string) (GetResponse, error) {
-	Conn, err := net.Dial("tcp", c.Addr)
-	if err != nil {
-		return GetResponse{}, err
-	}
-	// encode kvs
-	kv := Command{
-		Op:    GET,
-		Key:   key,
-		Value: "",
-	}
-	buf, err := kv.Encode()
-	if err != nil {
-		return GetResponse{}, err
-	}
-
-	// 发送消息
-	_, err = Conn.Write(buf)
-	if err != nil {
-		return GetResponse{}, err
-	}
-
-	// 创建一个足够大的缓冲区来存储数据
-	readBuf := make([]byte, 4096)
-
-	// 读取数据
-	n, err := Conn.Read(readBuf)
-	if err != nil {
-		fmt.Println("Error reading:", err.Error())
-		return GetResponse{}, err
-	}
-
-	// 使用读取的数据
-	data := readBuf[:n]
-
-	// 创建一个新的GetResponse
-	var resp GetResponse
-
-	// 创建一个新的解码器
-	dec := gob.NewDecoder(bytes.NewBuffer(data))
-
-	// 解码数据
-	err = dec.Decode(&resp)
-	if err != nil {
-		fmt.Println("Error decoding:", err.Error())
-		return GetResponse{}, err
-	}
-
-	return resp, nil
-}
-
-func (c *TcpClient) Put(key string, value string) error {
-	Conn, err := net.Dial("tcp", c.Addr)
-	if err != nil {
-		return err
-	}
-	// encode kvs
-	kv := Command{
-		Op:    PUT,
-		Key:   key,
-		Value: value,
-	}
-	buf, err := kv.Encode()
-	if err != nil {
-		return err
-	}
-
-	// 发送消息
-	_, err = Conn.Write(buf)
-
-	if err != nil {
-		return nil
-	}
-
-	// wait for server response
-	response := make([]byte, 256)
-	Conn.Read(response)
-	fmt.Println(string(response))
-	return nil
-}
-
-func (c *TcpClient) Delete(key string) error {
-	Conn, err := net.Dial("tcp", c.Addr)
-	if err != nil {
-		return err
-	}
-	// encode kvs
-	kv := Command{
-		Op:  DELETE,
-		Key: key,
-	}
-	buf, err := kv.Encode()
-	if err != nil {
-		return err
-	}
-
-	// 发送消息
-	_, err = Conn.Write(buf)
-	if err != nil {
-		return err
-	}
-
-	// wait for server response
-	response := make([]byte, 256)
-	Conn.Read(response)
-	fmt.Println(string(response))
-	return nil
+	bufPool *util.BufPool
 }
 
 func init() {
-	ycsb.RegisterDBCreator("etcd", etcdCreator{})
+	ycsb.RegisterDBCreator("sqlite", sqliteCreator{})
 }
 
-func (c etcdCreator) Create(p *properties.Properties) (ycsb.DB, error) {
+func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
+	d := new(sqliteDB)
+	d.p = p
 
-	log.Println("--------------------- CREATE ---------------------------")
-	return &etcdDB{
-		p: p,
-	}, nil
+	dbPath := p.GetString(sqliteDBPath, "/tmp/sqlite.db")
+
+	if p.GetBool(prop.DropData, prop.DropDataDefault) {
+		os.RemoveAll(dbPath)
+	}
+
+	mode := p.GetString(sqliteMode, "rwc")
+	journalMode := p.GetString(sqliteJournalMode, "WAL")
+	cache := p.GetString(sqliteCache, "shared")
+	maxOpenConns := p.GetInt(sqliteMaxOpenConns, 1)
+	maxIdleConns := p.GetInt(sqliteMaxIdleConns, 2)
+
+	v := url.Values{}
+	v.Set("cache", cache)
+	v.Set("mode", mode)
+	v.Set("_journal_mode", journalMode)
+	dsn := fmt.Sprintf("file:%s?%s", dbPath, v.Encode())
+	var err error
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxIdleConns)
+
+	d.optimistic = p.GetBool(sqliteOptimistic, false)
+	d.backoffMs = p.GetInt(sqliteOptimisticBackoffMs, 5)
+	d.verbose = p.GetBool(prop.Verbose, prop.VerboseDefault)
+	d.db = db
+
+	d.bufPool = util.NewBufPool()
+
+	if err := d.createTable(); err != nil {
+		return nil, err
+	}
+
+	return d, nil
 }
 
-func getClientConfig(p *properties.Properties) (*clientv3.Config, error) {
+func (db *sqliteDB) createTable() error {
+	tableName := db.p.GetString(prop.TableName, prop.TableNameDefault)
 
-	log.Println("--------------------- Init ---------------------------")
-	endpoints := p.GetString(etcdEndpoints, "localhost:2379")
+	fieldCount := db.p.GetInt64(prop.FieldCount, prop.FieldCountDefault)
+	fieldLength := db.p.GetInt64(prop.FieldLength, prop.FieldLengthDefault)
 
-	fmt.Printf("-----------------------endpoints %s --------------------\n", endpoints)
-	dialTimeout := p.GetDuration(etcdDialTimeout, 2*time.Second)
+	buf := new(bytes.Buffer)
+	s := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (YCSB_KEY VARCHAR(64) PRIMARY KEY", tableName)
+	buf.WriteString(s)
 
-	var tlsConfig *tls.Config
-	if strings.Contains(endpoints, "https") {
-		tlsInfo := transport.TLSInfo{
-			CertFile:      p.MustGetString(etcdCertFile),
-			KeyFile:       p.MustGetString(etcdKeyFile),
-			TrustedCAFile: p.MustGetString(etcdCaFile),
-		}
-		c, err := tlsInfo.ClientConfig()
+	for i := int64(0); i < fieldCount; i++ {
+		buf.WriteString(fmt.Sprintf(", FIELD%d VARCHAR(%d)", i, fieldLength))
+	}
+
+	buf.WriteString(");")
+
+	if db.verbose {
+		fmt.Println(buf.String())
+	}
+
+	_, err := db.db.Exec(buf.String())
+	return err
+}
+
+func (db *sqliteDB) Close() error {
+	if db.db == nil {
+		return nil
+	}
+
+	return db.db.Close()
+}
+
+func (db *sqliteDB) InitThread(ctx context.Context, _ int, _ int) context.Context {
+	return ctx
+}
+
+func (db *sqliteDB) CleanupThread(ctx context.Context) {
+
+}
+
+func (db *sqliteDB) optimisticTx(ctx context.Context, f func(tx *sql.Tx) error) error {
+	for {
+		tx, err := db.db.BeginTx(ctx, nil)
 		if err != nil {
+			return err
+		}
+
+		if err = f(tx); err != nil {
+			tx.Rollback()
+			return err
+		}
+
+		err = tx.Commit()
+		if err != nil && db.optimistic {
+			if err, ok := err.(sqlite3.Error); ok && (err.Code == sqlite3.ErrBusy ||
+				err.ExtendedCode == sqlite3.ErrIoErrUnlock) {
+				time.Sleep(time.Duration(db.backoffMs) * time.Millisecond)
+				continue
+			}
+		}
+		return err
+	}
+}
+
+func (db *sqliteDB) doQueryRows(ctx context.Context, tx *sql.Tx, query string, count int, args ...interface{}) ([]map[string][]byte, error) {
+	if db.verbose {
+		fmt.Printf("%s %v\n", query, args)
+	}
+
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	vs := make([]map[string][]byte, 0, count)
+	for rows.Next() {
+		m := make(map[string][]byte, len(cols))
+		dest := make([]interface{}, len(cols))
+		for i := 0; i < len(cols); i++ {
+			v := new([]byte)
+			dest[i] = v
+		}
+		if err = rows.Scan(dest...); err != nil {
 			return nil, err
 		}
-		tlsConfig = c
-	}
 
-	return &clientv3.Config{
-		Endpoints:   strings.Split(endpoints, ","),
-		DialTimeout: dialTimeout,
-		TLS:         tlsConfig,
-	}, nil
-}
-
-func (db *etcdDB) Close() error {
-	return nil
-	//return db.client.Close()
-}
-
-type mytype string
-
-var thread mytype = "tid"
-
-func (db *etcdDB) InitThread(ctx context.Context, threadId int, threadCount int) context.Context {
-	if len(db.client) != threadCount {
-		db.client = make([]*TcpClient, threadCount)
-		for i := range db.client {
-			addr := fmt.Sprintf("localhost:%v", 9360+i)
-			db.client[i] = &TcpClient{Addr: addr}
+		for i, v := range dest {
+			m[cols[i]] = *v.(*[]byte)
 		}
+
+		vs = append(vs, m)
 	}
-	log.Printf("------------------------ InitThread %d ----------------------------------\n", threadId)
-	return context.WithValue(ctx, thread, threadId)
+
+	return vs, rows.Err()
 }
 
-func (db *etcdDB) CleanupThread(_ context.Context) {
-}
+func (db *sqliteDB) doRead(ctx context.Context, tx *sql.Tx, table string, key string, fields []string) (map[string][]byte, error) {
+	var query string
+	if len(fields) == 0 {
+		query = fmt.Sprintf(`SELECT * FROM %s WHERE YCSB_KEY = ?`, table)
+	} else {
+		query = fmt.Sprintf(`SELECT %s FROM %s WHERE YCSB_KEY = ?`, strings.Join(fields, ","), table)
+	}
 
-func getRowKey(table string, key string) string {
-	return fmt.Sprintf("%s:%s", table, key)
-}
+	rows, err := db.doQueryRows(ctx, tx, query, 1, key)
 
-func (db *etcdDB) Read(ctx context.Context, table string, key string, _ []string) (map[string][]byte, error) {
-	tid := ctx.Value(thread).(int)
-
-	rkey := getRowKey(table, key)
-	value, err := db.client[tid].Get(rkey)
 	if err != nil {
-		fmt.Println("client get rky 201 error")
 		return nil, err
+	} else if len(rows) == 0 {
+		return nil, nil
 	}
 
-	if value.Count == 0 {
-		fmt.Println("value count  xxzdsfa error")
-		return nil, fmt.Errorf("could not find value for key [%s]", rkey)
-	}
-
-	var r map[string][]byte
-	log.Println("------------------------ read ----------------------------------")
-	err = json.NewDecoder(bytes.NewReader([]byte(value.Kvs[0].Value))).Decode(&r)
-	if err != nil {
-		fmt.Println("Read NewDecoder error")
-		return nil, err
-	}
-	return r, nil
+	return rows[0], nil
 }
 
-func (db *etcdDB) Scan(ctx context.Context, table string, startKey string, count int, _ []string) ([]map[string][]byte, error) {
-	tid := ctx.Value(thread).(int)
+func (db *sqliteDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
+	var output map[string][]byte
+	err := db.optimisticTx(ctx, func(tx *sql.Tx) error {
+		res, err := db.doRead(ctx, tx, table, key, fields)
+		output = res
+		return err
+	})
+	return output, err
+}
 
-	res := make([]map[string][]byte, count)
-	rkey := getRowKey(table, startKey)
-	values, err := db.client[tid].Get(rkey)
-	if err != nil {
-		fmt.Println("Get xxzdsfa error")
-		return nil, err
+func (db *sqliteDB) doScan(ctx context.Context, tx *sql.Tx, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+	var query string
+	if len(fields) == 0 {
+		query = fmt.Sprintf(`SELECT * FROM %s WHERE YCSB_KEY >= ? LIMIT ?`, table)
+	} else {
+		query = fmt.Sprintf(`SELECT %s FROM %s WHERE YCSB_KEY >= ? LIMIT ?`, strings.Join(fields, ","), table)
 	}
 
-	if values.Count != int64(count) {
-		fmt.Println("Counts error")
-		return nil, fmt.Errorf("unexpected number of result for key [%s], expected %d but was %d", rkey, count, values.Count)
-	}
+	rows, err := db.doQueryRows(ctx, tx, query, count, startKey, count)
 
-	for _, v := range values.Kvs {
-		var r map[string][]byte
-		err = json.NewDecoder(bytes.NewReader([]byte(v.Value))).Decode(&r)
-		if err != nil {
-			fmt.Println("NewDecoder xcsdaFD error")
-			return nil, err
+	return rows, err
+}
+
+func (db *sqliteDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+	var output []map[string][]byte
+	err := db.optimisticTx(ctx, func(tx *sql.Tx) error {
+		res, err := db.doScan(ctx, tx, table, startKey, count, fields)
+		output = res
+		return err
+	})
+	return output, err
+}
+
+func (db *sqliteDB) doUpdate(ctx context.Context, tx *sql.Tx, table string, key string, values map[string][]byte) error {
+	buf := bytes.NewBuffer(db.bufPool.Get())
+	defer func() {
+		db.bufPool.Put(buf.Bytes())
+	}()
+
+	buf.WriteString("UPDATE ")
+	buf.WriteString(table)
+	buf.WriteString(" SET ")
+	firstField := true
+	pairs := util.NewFieldPairs(values)
+	args := make([]interface{}, 0, len(values)+1)
+	for _, p := range pairs {
+		if firstField {
+			firstField = false
+		} else {
+			buf.WriteString(", ")
 		}
-		res = append(res, r)
+
+		buf.WriteString(p.Field)
+		buf.WriteString(`= ?`)
+		args = append(args, p.Value)
 	}
-	return res, nil
+	buf.WriteString(" WHERE YCSB_KEY = ?")
+
+	args = append(args, key)
+
+	_, err := tx.ExecContext(ctx, buf.String(), args...)
+	return err
 }
 
-func (db *etcdDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
-	tid := ctx.Value(thread).(int)
-
-	rkey := getRowKey(table, key)
-	data, err := json.Marshal(values)
-	if err != nil {
-		fmt.Println("Marshal error")
-		return err
-	}
-	err = db.client[tid].Put(rkey, string(data))
-	if err != nil {
-		fmt.Println("Put 1234 error")
-		return err
-	}
-
-	return nil
+func (db *sqliteDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
+	return db.optimisticTx(ctx, func(tx *sql.Tx) error {
+		return db.doUpdate(ctx, tx, table, key, values)
+	})
 }
 
-func (db *etcdDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
-	fmt.Println("-------------------- Insert -------------------------------")
-	return db.Update(ctx, table, key, values)
-}
+func (db *sqliteDB) doInsert(ctx context.Context, tx *sql.Tx, table string, key string, values map[string][]byte) error {
+	args := make([]interface{}, 0, 1+len(values))
+	args = append(args, key)
 
-func (db *etcdDB) Delete(ctx context.Context, table string, key string) error {
-	tid := ctx.Value(thread).(int)
+	buf := bytes.NewBuffer(db.bufPool.Get())
+	defer func() {
+		db.bufPool.Put(buf.Bytes())
+	}()
 
-	err := db.client[tid].Delete(getRowKey(table, key))
-	if err != nil {
-		return err
+	buf.WriteString("INSERT OR IGNORE INTO ")
+	buf.WriteString(table)
+	buf.WriteString(" (YCSB_KEY")
+
+	pairs := util.NewFieldPairs(values)
+	for _, p := range pairs {
+		args = append(args, p.Value)
+		buf.WriteString(" ,")
+		buf.WriteString(p.Field)
 	}
-	return nil
+	buf.WriteString(") VALUES (?")
+
+	for i := 0; i < len(pairs); i++ {
+		buf.WriteString(" ,?")
+	}
+
+	buf.WriteByte(')')
+
+	_, err := tx.ExecContext(ctx, buf.String(), args...)
+	if err != nil && db.verbose {
+		fmt.Printf("error(doInsert): %s: %+v\n", buf.String(), err)
+	}
+	return err
 }
+
+func (db *sqliteDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
+	return db.optimisticTx(ctx, func(tx *sql.Tx) error { return db.doInsert(ctx, tx, table, key, values) })
+}
+
+func (db *sqliteDB) doDelete(ctx context.Context, tx *sql.Tx, table string, key string) error {
+	query := fmt.Sprintf(`DELETE FROM %s WHERE YCSB_KEY = ?`, table)
+	_, err := tx.ExecContext(ctx, query, key)
+	return err
+}
+
+func (db *sqliteDB) Delete(ctx context.Context, table string, key string) error {
+	return db.optimisticTx(ctx, func(tx *sql.Tx) error { return db.doDelete(ctx, tx, table, key) })
+}
+
+func (db *sqliteDB) BatchInsert(ctx context.Context, table string, keys []string, values []map[string][]byte) error {
+	return db.optimisticTx(ctx, func(tx *sql.Tx) error {
+		for i := 0; i < len(keys); i++ {
+			err := db.doInsert(ctx, tx, table, keys[i], values[i])
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (db *sqliteDB) BatchRead(ctx context.Context, table string, keys []string, fields []string) ([]map[string][]byte, error) {
+	var output []map[string][]byte
+	err := db.optimisticTx(ctx, func(tx *sql.Tx) error {
+		for i := 0; i < len(keys); i++ {
+			res, err := db.doRead(ctx, tx, table, keys[i], fields)
+			if err != nil {
+				return err
+			}
+			output = append(output, res)
+		}
+		return nil
+	})
+	return output, err
+}
+
+func (db *sqliteDB) BatchUpdate(ctx context.Context, table string, keys []string, values []map[string][]byte) error {
+	return db.optimisticTx(ctx, func(tx *sql.Tx) error {
+		for i := 0; i < len(keys); i++ {
+			err := db.doUpdate(ctx, tx, table, keys[i], values[i])
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (db *sqliteDB) BatchDelete(ctx context.Context, table string, keys []string) error {
+	return db.optimisticTx(ctx, func(tx *sql.Tx) error {
+		for i := 0; i < len(keys); i++ {
+			err := db.doDelete(ctx, tx, table, keys[i])
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+var _ ycsb.BatchDB = (*sqliteDB)(nil)
